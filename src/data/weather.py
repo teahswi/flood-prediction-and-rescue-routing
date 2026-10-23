@@ -82,7 +82,7 @@ class WeatherClient:
                 "longitude": lon,
                 "hourly": "precipitation,temperature_2m,relative_humidity_2m,wind_speed_10m",
                 "forecast_days": 2,
-                "timezone": "auto",
+                "timezone": "UTC",
                 "past_days": 3,
             }
             resp = self._session.get(self.BASE_URL, params=params, timeout=self.timeout)
@@ -179,7 +179,7 @@ class WeatherClient:
                 "longitude": lon,
                 "hourly": "precipitation,temperature_2m,relative_humidity_2m,wind_speed_10m",
                 "forecast_days": 1,
-                "timezone": "auto",
+                "timezone": "UTC",
                 "past_days": days_back,
             }
             resp = self._session.get(self.BASE_URL, params=params, timeout=self.timeout)
@@ -252,7 +252,12 @@ def get_weather(lat: float, lon: float, use_cache: bool = True) -> WeatherRecord
     Returns:
         WeatherRecord populated with current conditions and short-range forecast.
     """
-    cache_key = f"weather_{lat:.3f}_{lon:.3f}"
+    if not (-90.0 <= float(lat) <= 90.0):
+        raise ValueError(f"Latitude must be between -90 and 90, got {lat}.")
+    if not (-180.0 <= float(lon) <= 180.0):
+        raise ValueError(f"Longitude must be between -180 and 180, got {lon}.")
+
+    cache_key = f"weather_{float(lat):.3f}_{float(lon):.3f}"
 
     if use_cache and cache_key in _cache:
         record, cached_at = _cache[cache_key]

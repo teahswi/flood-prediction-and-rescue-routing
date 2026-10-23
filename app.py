@@ -25,6 +25,19 @@ warnings.filterwarnings('ignore')
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+from src.data.roads import RoadNetworkLoader
+from src.flood.features import (
+    FloodFeatureVector,
+    HistoricalFeatures,
+    RainfallFeatures,
+    TerrainFeatures,
+)
+from src.flood.risk_model import FloodRiskModel
+from src.flood.simulation import SimulationScenario, run_simulation
+from src.routing.graph_builder import FloodAwareGraphBuilder
+from src.routing.hazard_cost import HazardCostFunction
+from src.routing.route_planner import RoutePlanner
+
 # Page config MUST be first streamlit call
 st.set_page_config(
     page_title="Flood Prediction & Rescue Routing",
@@ -507,6 +520,7 @@ def load_weather_data(lat: float, lon: float) -> dict:
     """Fetch weather data; falls back to synthetic demo data on any failure."""
     try:
         from src.data.weather import get_weather
+        from src.data.weather import WeatherClient
 
         record = get_weather(lat, lon)
         if record.is_stale:
@@ -526,6 +540,10 @@ def load_weather_data(lat: float, lon: float) -> dict:
             "fetched_at": record.fetched_at.isoformat(),
             "is_stale": False,
         }
+        hourly = WeatherClient().fetch_hourly_series(lat, lon, days_back=3)
+        data["hourly_observations"] = (
+            hourly.to_dict(orient="records") if not hourly.empty else []
+        )
         return data
     except (ImportError, RuntimeError, OSError, ValueError) as exc:
         st.warning(f"Live weather unavailable; using demo data ({exc}).")
@@ -603,34 +621,45 @@ def compute_flood_risk(
     if weather is None:
         weather = {}
 
-    # Rainfall sub-score (0–1)
-    rain_1h = weather.get("rainfall_mm_hr", 0.0)
-    rain_24 = weather.get("rainfall_24h_mm", 0.0)
-    rainfall_risk = min(1.0, (rain_1h / 64.5) * 0.5 + (rain_24 / 200.0) * 0.5)
-
-    # Terrain sub-score (lower elevation → higher risk)
-    terrain_risk = max(0.0, min(1.0, 1.0 - elevation_m / 20.0))
-
-    # Historical: Mumbai-specific coastal proximity proxy
-    dist_coast_deg = abs(lon - 72.82)
-    historical_risk = max(0.0, min(1.0, 0.6 - dist_coast_deg * 3.0))
-
-    # Drainage (simplified — urban areas drain poorly during heavy rain)
-    drainage_risk = min(1.0, rain_1h / 50.0 * 0.7 + 0.1)
-
-    lam = st.session_state.get("lambda_weight", 2.0)
-    weights = {"rainfall": 0.45, "terrain": 0.25, "historical": 0.15, "drainage": 0.15}
-    raw = (
-        weights["rainfall"] * rainfall_risk
-        + weights["terrain"] * terrain_risk
-        + weights["historical"] * historical_risk
-        + weights["drainage"] * drainage_risk
+    rainfall = RainfallFeatures(
+        current_mm_hr=float(weather.get("rainfall_mm_hr", 0.0)),
+        last_24h_mm=float(weather.get("rainfall_24h_mm", 0.0)),
+        last_72h_mm=float(weather.get("rainfall_72h_mm", 0.0)),
+        forecast_1h_mm=float(weather.get("forecast_1h_mm", 0.0)),
+        forecast_3h_mm=float(weather.get("forecast_3h_mm", 0.0)),
+        forecast_6h_mm=float(weather.get("forecast_6h_mm", 0.0)),
+        imd_alert_level=str(weather.get("imd_alert", "Unknown")),
     )
-    score = float(np.clip(raw * (lam / 2.0), 0.0, 1.0))
+    terrain = TerrainFeatures(
+        elevation_m=float(elevation_m),
+        slope_deg=0.0,
+        is_depression=False,
+        flow_accumulation=0.0,
+    )
+    features = FloodFeatureVector(
+        lat=lat,
+        lon=lon,
+        timestamp=datetime.utcnow(),
+        rainfall=rainfall,
+        terrain=terrain,
+        historical=HistoricalFeatures(),
+        data_quality={
+            "rainfall": bool(weather) and not bool(weather.get("is_stale", True)),
+            "terrain": elevation_m is not None,
+            "historical": False,
+            "drainage": False,
+        },
+    )
+    assessment = FloodRiskModel().predict(features)
+    rainfall_risk = assessment.rainfall_risk
+    terrain_risk = assessment.terrain_risk
+    historical_risk = assessment.historical_risk
+    drainage_risk = assessment.drainage_risk
+    score = assessment.composite_risk_score
 
     return {
         "score": round(score, 3),
-        "label": get_risk_label(score),
+        "label": assessment.risk_label,
         "color": get_risk_color(score),
         "rainfall_risk": round(rainfall_risk, 3),
         "terrain_risk": round(terrain_risk, 3),
@@ -642,6 +671,8 @@ def compute_flood_risk(
             "Historical": historical_risk,
             "Drainage": drainage_risk,
         },
+        "data_gaps": assessment.data_gaps,
+        "uncertainty_note": assessment.uncertainty_note,
     }
 
 
@@ -905,6 +936,64 @@ def run_demo_simulation(
     }
 
 
+def run_backend_simulation(
+    scenario_name: str,
+    scenario_rainfall: float,
+    duration_hours: float,
+    land_cover: str,
+    center_lat: float,
+    center_lon: float,
+    radius_km: float,
+) -> dict:
+    """Run the shared flood engine and adapt its result for the dashboard."""
+    scenario = SimulationScenario(
+        scenario_id=f"ui-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+        name=scenario_name,
+        center_lat=center_lat,
+        center_lon=center_lon,
+        radius_km=radius_km,
+        rainfall_mm_hr=scenario_rainfall,
+        duration_hours=duration_hours,
+        land_cover=land_cover.lower(),
+    )
+    result = run_simulation(
+        scenario,
+        terrain_grid=st.session_state.get("terrain_grid"),
+        level=2,
+    )
+    summary = result.summary()
+    arrival = result.flood_arrival_time_minutes
+    valid_arrivals = arrival[arrival >= 0]
+    first_flood = int(valid_arrivals.min()) if valid_arrivals.size else None
+    cn = result.time_steps[0].water_depth_m.size if not result.time_steps else None
+    return {
+        "time_steps": [
+            {
+                "elapsed_min": step.elapsed_minutes,
+                "flooded_area_km2": round(step.flooded_area_km2, 3),
+                "max_depth_m": round(step.max_depth_m, 3),
+                "avg_depth_m": round(step.mean_depth_m, 3),
+            }
+            for step in result.time_steps
+        ],
+        "final_grid": result.max_depth_m.tolist(),
+        "lats": result.grid_lats.tolist(),
+        "lons": result.grid_lons.tolist(),
+        "summary": {
+            "total_flooded_km2": summary["flooded_area_km2"],
+            "max_depth_m": summary["max_depth_m"],
+            "time_to_first_flood_min": first_flood,
+            "cn": "SCS-CN backend",
+            "S_mm": None,
+            "rainfall_mm_hr": scenario_rainfall,
+            "duration_hr": duration_hours,
+            "land_cover": land_cover,
+            "simulation_level": summary["simulation_level"],
+            "limitations": result.limitations,
+        },
+    }
+
+
 def compute_demo_routes(
     start_lat: float, start_lon: float,
     end_lat: float, end_lon: float,
@@ -976,6 +1065,74 @@ def compute_demo_routes(
     }
 
 
+def compute_backend_routes(
+    start_lat: float,
+    start_lon: float,
+    end_lat: float,
+    end_lon: float,
+    flood_risk: float,
+) -> dict:
+    """Load OSM roads, annotate them with flood risk, and plan real routes."""
+    loader = RoadNetworkLoader()
+    graph = loader.load_graph(
+        st.session_state.study_area["lat"],
+        st.session_state.study_area["lon"],
+        st.session_state.study_area["radius_km"],
+    )
+    cost_fn = HazardCostFunction(
+        lambda_hazard=float(st.session_state.get("lambda_weight", 2.0)),
+        impassable_threshold=0.85,
+        high_hazard_threshold=0.65,
+    )
+    graph_result = FloodAwareGraphBuilder(cost_fn).build(
+        graph,
+        flood_risk_fn=lambda _lat, _lon: float(flood_risk),
+    )
+    st.session_state.road_graph = graph_result
+    comparison = RoutePlanner(cost_fn).plan_routes(
+        graph_result, start_lat, start_lon, end_lat, end_lon
+    )
+
+    def _route_dict(route, name: str) -> dict:
+        if route is None:
+            return {
+                "name": name,
+                "distance_km": 0.0,
+                "time_min": 0.0,
+                "flood_exposure": 0.0,
+                "safety_score": 0.0,
+                "coords": [],
+                "segments": [],
+                "is_feasible": False,
+                "warning": "No route was found.",
+            }
+        coords = []
+        if route.geometry is not None:
+            coords = [(float(y), float(x)) for x, y in route.geometry.coords]
+        return {
+            "name": name,
+            "distance_km": round(route.total_distance_m / 1000.0, 3),
+            "time_min": round(route.total_travel_time_s / 60.0, 2),
+            "flood_exposure": round(route.total_hazard_exposure, 4),
+            "safety_score": round(max(0.0, 1.0 - route.max_segment_risk), 3),
+            "coords": coords,
+            "segments": [{"coords": coords, "flooded": False, "label": name}]
+            if coords else [],
+            "is_feasible": route.is_feasible,
+            "warning": "; ".join(route.route_warnings) or route.infeasible_reason,
+        }
+
+    return {
+        "baseline": _route_dict(comparison.baseline_distance, "Baseline (Shortest)"),
+        "flood_aware": _route_dict(comparison.flood_aware, "Flood-Aware (Recommended)"),
+        "fastest": _route_dict(comparison.baseline_time, "Fastest Available"),
+        "start": [start_lat, start_lon],
+        "end": [end_lat, end_lon],
+        "recommendation": comparison.recommendation,
+        "blocked_edges": graph_result.num_blocked_edges,
+    }
+
+
 def format_time_delta(minutes: float) -> str:
     """Format minutes as 'Xh Ym'."""
     h = int(minutes // 60)
@@ -986,28 +1143,26 @@ def format_time_delta(minutes: float) -> str:
 
 
 def _generate_rainfall_series(weather_data: dict | None) -> pd.DataFrame:
-    """Generate a 72h + 6h synthetic rainfall time-series."""
-    rng = np.random.default_rng(77)
+    """Build an observed rainfall series and a clearly separated forecast."""
     now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-    times = [now - timedelta(hours=72 - i) for i in range(79)]
-    base = weather_data.get("rainfall_mm_hr", 18.5) if weather_data else 18.5
-    # Build plausible monsoon pattern
-    vals = []
-    cur = base * 0.3
-    for i, t in enumerate(times):
-        # forecast portion
-        is_forecast = i >= 72
-        if i % 24 < 6:
-            cur = cur * 0.7 + rng.uniform(0, base * 0.5) * 0.3
-        elif i % 24 < 12:
-            cur = cur * 0.5 + rng.uniform(base * 0.3, base * 1.2) * 0.5
-        else:
-            cur = cur * 0.6 + rng.uniform(base * 0.1, base * 0.8) * 0.4
-        cur = float(np.clip(cur + rng.uniform(-3, 3), 0, 130))
-        vals.append(cur)
-    df = pd.DataFrame({"datetime": times, "rainfall_mm_hr": vals})
-    df["is_forecast"] = df["datetime"] > now - timedelta(hours=1)
-    return df
+    observations = (weather_data or {}).get("hourly_observations", [])
+    if not observations:
+        return pd.DataFrame(columns=["datetime", "rainfall_mm_hr", "is_forecast"])
+    observed = pd.DataFrame(observations)
+    observed["datetime"] = pd.to_datetime(observed["timestamp"]).dt.tz_localize(None)
+    observed = observed.rename(columns={"precipitation_mm": "rainfall_mm_hr"})
+    observed = observed[["datetime", "rainfall_mm_hr"]].copy()
+    observed["is_forecast"] = False
+    forecast = pd.DataFrame({
+        "datetime": [now + timedelta(hours=i + 1) for i in range(3)],
+        "rainfall_mm_hr": [
+            float((weather_data or {}).get("forecast_1h_mm", 0.0)),
+            float((weather_data or {}).get("forecast_3h_mm", 0.0)) / 3.0,
+            float((weather_data or {}).get("forecast_6h_mm", 0.0)) / 6.0,
+        ],
+        "is_forecast": True,
+    })
+    return pd.concat([observed, forecast], ignore_index=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1047,7 +1202,7 @@ with tab1:
     with map_col:
         # Data freshness banner
         data_source = weather.get("source", "demo")
-        if data_source == "demo":
+        if data_source == "demo" or weather.get("is_stale", False):
             st.markdown(
                 '<div class="warning-banner">⚠️ <b>Demo Mode:</b> Displaying synthetic data — live API unavailable. '
                 'All values are illustrative only.</div>',
@@ -1167,6 +1322,12 @@ with tab1:
                 f'{imd}</span>',
                 unsafe_allow_html=True,
             )
+            if risk["data_gaps"]:
+                st.warning(
+                    "Risk index has missing inputs: "
+                    + ", ".join(risk["data_gaps"])
+                    + ". It is not a validated probability forecast."
+                )
             if weather.get("source") == "demo":
                 st.markdown(
                     '<span style="color:#f39c12;font-size:0.78rem;">⚠️ Demo data — live API not reached</span>',
@@ -1186,9 +1347,17 @@ with tab1:
 
             if st.button("🗺️ Compute Routes", key="btn_compute_routes"):
                 with st.spinner("Computing routes …"):
-                    rc = compute_demo_routes(slat, slon, elat, elon, risk["score"])
-                    st.session_state.route_comparison = rc
-                st.success("Routes computed!")
+                    try:
+                        rc = compute_backend_routes(slat, slon, elat, elon, risk["score"])
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        st.session_state.route_comparison = None
+                        st.error(f"Live road routing failed: {exc}")
+                    else:
+                        st.session_state.route_comparison = rc
+                        st.success(
+                            f"Routes computed from OpenStreetMap. "
+                            f"Blocked edges: {rc['blocked_edges']}."
+                        )
 
             if st.session_state.route_comparison:
                 rc = st.session_state.route_comparison
@@ -1204,7 +1373,9 @@ with tab1:
                         "Safety": f"{r['safety_score']:.2f}",
                     })
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-                st.caption("✅ Flood-aware route selected on map")
+                if rc.get("recommendation"):
+                    st.caption(rc["recommendation"])
+                st.caption("Routes are based on the downloaded OSM graph and current risk inputs.")
 
         # ── Map Layers ──
         with st.expander("🗂️ Map Layers", expanded=True):
@@ -1336,7 +1507,7 @@ with tab2:
             "Data": "Rainfall, Temperature, Humidity",
             "Last Updated": fetched_str[:16],
             "Freshness": freshness_str,
-            "Status": "✅ Live" if weather.get("source") == "api" else "⚠️ Demo",
+            "Status": "✅ Live" if weather.get("source") == "open-meteo" and not weather.get("is_stale", False) else "⚠️ Demo/Stale",
             "Coverage": "Global (hourly)",
         },
         {
@@ -1452,7 +1623,8 @@ with tab3:
             st.session_state.scenario_duration = sim_duration
             st.session_state.scenario_land_cover = sim_lc
             with st.spinner(f"Running '{scenario_name}' …"):
-                result = run_demo_simulation(
+                result = run_backend_simulation(
+                    scenario_name,
                     sim_rain, sim_duration, sim_lc,
                     st.session_state.study_area["lat"],
                     st.session_state.study_area["lon"],
